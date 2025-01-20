@@ -1,0 +1,163 @@
+FROM debian:stable-slim
+
+ARG NGINX_VERSION=1.25.5
+ARG OPENSSL_VERSION=3.4.0
+ARG ZLIB_VERSION=1.3.1
+ARG LUAJIT2_VERSION=2.1-20241113
+ARG NGX_DEVEL_KIT_VERSION=0.3.3
+ARG LUA_NGINX_MODULE_VERSION=0.10.27
+ARG LUA_RESTY_CORE_VERSION=0.1.30
+ARG LUA_RESTY_LRUCACHE_VERSION=0.15
+ARG NGINX_OTEL_VERSION=0.1.1
+ARG ABSEIL_VERSION=20211102.0
+ARG GRPC_VERSION=1.46.7
+ARG OPENTELEMETRY_CPP_VERSION=1.18.0
+ARG OPENTELEMETRY_PROTO_VERSION=1.4.0
+ARG PROTOBUF_VERSION=3.19.5
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG ROOT_DIR=/tmp/build
+ARG GITHUB=https://github.com
+ARG CMAKE_COMMON="-DCMAKE_CXX_STANDARD=17 -DCMAKE_CXX_EXTENSIONS=OFF \
+  -DCMAKE_CXX_VISIBILITY_PRESET=hidden -DCMAKE_POLICY_DEFAULT_CMP0063=NEW \
+  -DCMAKE_PREFIX_PATH=${ROOT_DIR}/ -DCMAKE_INSTALL_PREFIX:STRING=${ROOT_DIR}/ \
+  -DCMAKE_INSTALL_LIBDIR:STRING=lib -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+  -DCMAKE_BUILD_TYPE=RelWithDebInfo"
+
+WORKDIR /tmp
+
+RUN apt update -y && apt -y upgrade && apt -y install curl gcc make perl libc6-dev libxslt1-dev libxml2-dev \
+      zlib1g-dev libpcre3-dev libbz2-dev libssl-dev cmake libre2-dev libc-ares-dev pkg-config g++
+
+RUN curl http://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz | tar xzf - && mv nginx-${NGINX_VERSION} nginx && \
+  curl -L ${GITHUB}/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz | tar xzf - && \
+  curl -L http://zlib.net/zlib-${ZLIB_VERSION}.tar.gz | tar xzf - && \
+  curl -L ${GITHUB}/openresty/luajit2/archive/refs/tags/v${LUAJIT2_VERSION}.tar.gz | tar xzf - && \
+  curl -L ${GITHUB}/vision5/ngx_devel_kit/archive/refs/tags/v${NGX_DEVEL_KIT_VERSION}.tar.gz | tar xzf - && \
+  curl -L ${GITHUB}/openresty/lua-nginx-module/archive/refs/tags/v${LUA_NGINX_MODULE_VERSION}.tar.gz | tar xzf - && \
+  curl -L ${GITHUB}/openresty/lua-resty-core/archive/refs/tags/v${LUA_RESTY_CORE_VERSION}.tar.gz | tar xzf - && \
+  curl -L ${GITHUB}/openresty/lua-resty-lrucache/archive/refs/tags/v${LUA_RESTY_LRUCACHE_VERSION}.tar.gz | tar xzf - && \
+  curl -L ${GITHUB}/abseil/abseil-cpp/archive/refs/tags/${ABSEIL_VERSION}.tar.gz | tar xzf - && \
+  curl -L ${GITHUB}/nginxinc/nginx-otel/archive/refs/tags/v${NGINX_OTEL_VERSION}.tar.gz | tar xzf - && \
+  curl -L ${GITHUB}/grpc/grpc/archive/v${GRPC_VERSION}.tar.gz | tar xzf - && \
+  curl -L ${GITHUB}/open-telemetry/opentelemetry-cpp/archive/v${OPENTELEMETRY_CPP_VERSION}.tar.gz | tar xzf - && \
+  curl -L ${GITHUB}/open-telemetry/opentelemetry-proto/archive/v${OPENTELEMETRY_PROTO_VERSION}.tar.gz | tar xzf - && \
+  curl -L ${GITHUB}/protocolbuffers/protobuf/archive/refs/tags/v${PROTOBUF_VERSION}.tar.gz | tar xzf -
+
+# You can also change the installation directory to any other directory you like with the LUA_LIB_DIR argument.
+## cd lua-resty-core; sudo make install LUA_LIB_DIR=/opt/nginx/lualib
+# After that, you need to add the above directory to the LuaJIT search direcotries with lua_package_path nginx directive in the http context and stream context.
+## lua_package_path "/opt/nginx/lualib/?.lua;;";
+
+# configure - this configuration enables every possible module, except:
+# 1) --with-cpp_test_module --with-google_perftools_module
+#    Not needed for production build.
+# 2) --with-http_xslt_module --with-http_image_filter_module --with-http_geoip_module
+#    Requires additional modules to be built from sources, or symlinked to proper paths as configure lookups those in /usr/local, /usr/pkg and /opt/local.
+# 3) --with-http_perl_module
+#    Perl needs to be built from source, as Debian's pkg does not deliver static library.
+# Setting --prefix to /opt/nginx results in nginx by default:
+#  1) logging to /opt/nginx/logs/error.log 
+#  2) reading cfg file from /opt/nginx/conf/nginx.conf
+
+RUN cd luajit2-${LUAJIT2_VERSION} && DESTDIR=${ROOT_DIR} CFLAGS="-fPIC" make install 
+
+RUN export PATH=${ROOT_DIR}/bin/:$PATH && \
+	export CMAKE_PREFIX_PATH=${ROOT_DIR}/ && \
+	cd /tmp/abseil-cpp-${ABSEIL_VERSION} && mkdir build && cd build && \
+	cmake ${CMAKE_COMMON} -DBUILD_TESTING=OFF -DWITH_BENCHMARK=OFF ../ && \
+	make -j$(nproc) install && \
+	cd /tmp/protobuf-${PROTOBUF_VERSION} && mkdir build && cd build && \
+	cmake ${CMAKE_COMMON} -Dprotobuf_BUILD_TESTS=OFF ../cmake/ && \
+	make -j$(nproc) install && \
+	cd /tmp/grpc-${GRPC_VERSION} && mkdir build && cd build && \
+	CXXFLAGS='-Wno-error=format-security -DGRPC_NO_XDS -DGRPC_NO_RLS' \
+      cmake ${CMAKE_COMMON} -DgRPC_BUILD_GRPC_RUBY_PLUGIN=OFF \
+		-DgRPC_BUILD_GRPC_PYTHON_PLUGIN=OFF \
+		-DgRPC_BUILD_GRPC_PHP_PLUGIN=OFF \
+		-DgRPC_BUILD_GRPC_OBJECTIVE_C_PLUGIN=OFF \
+		-DgRPC_BUILD_GRPC_NODE_PLUGIN=OFF \
+		-DgRPC_BUILD_GRPC_CSHARP_PLUGIN=OFF \
+		-DgRPC_BUILD_CSHARP_EXT=OFF \
+		-DgRPC_BUILD_CODEGEN=ON \
+		-DgRPC_SSL_PROVIDER=package \
+		-DgRPC_ZLIB_PROVIDER=package \
+		-DgRPC_CARES_PROVIDER=package \
+		-DgRPC_ABSL_PROVIDER=package \
+		-DgRPC_PROTOBUF_PROVIDER=package \
+		-DgRPC_PROTOBUF_PACKAGE_TYPE=CONFIG \
+		-DgRPC_USE_PROTO_LITE=ON ../ && \
+	make -j$(nproc) install && \
+	cd /tmp/opentelemetry-cpp-${OPENTELEMETRY_CPP_VERSION} && mkdir build && cd build && \
+ 	cmake ${CMAKE_COMMON} -DBUILD_TESTING=OFF -DWITH_ABSEIL=OFF \
+      -DWITH_BENCHMARK=OFF -DWITH_EXAMPLES=OFF ../ && \
+	make -j$(nproc) install
+
+RUN export PATH=${ROOT_DIR}/bin/:$PATH && \
+    export NGX_OTEL_PROTO_DIR=/tmp/opentelemetry-proto-${OPENTELEMETRY_PROTO_VERSION} && \
+    export CMAKE_PREFIX_PATH=${ROOT_DIR}/ && \
+    export NGX_OTEL_CMAKE_OPTS="-DNGX_OTEL_GRPC=package -DNGX_OTEL_SDK=package -DNGX_OTEL_PROTO_DIR=$NGX_OTEL_PROTO_DIR" && \
+    export USE_LUAJIT=1 && \
+    export LUAJIT_LIB=${ROOT_DIR}/usr/local/lib && \
+    export LUAJIT_INC=${ROOT_DIR}/usr/local/include/luajit-2.1 && \
+    cd nginx && \
+    ./configure \
+    --conf-path=nginx.conf \
+    --error-log-path=logs/error.log \
+    --http-client-body-temp-path=tmp/client_body_temp/ \
+    --http-proxy-temp-path=tmp/proxy_temp/ \
+    --pid-path=nginx.pid \
+    --prefix=. \
+    --sbin-path=. \
+    --with-cc-opt='-DTCP_FASTOPEN=23' \
+    --with-cpu-opt=generic \
+    --with-file-aio \
+    --with-http_gzip_static_module \
+    --with-http_realip_module \
+    --with-http_ssl_module \
+    --with-http_stub_status_module \
+    --with-http_sub_module \
+    --with-ld-opt="-Wl,-rpath,${LUAJIT_LIB}" \
+    --add-module=../ngx_devel_kit-${NGX_DEVEL_KIT_VERSION} \
+    --add-module=../lua-nginx-module-${LUA_NGINX_MODULE_VERSION} \
+    --add-dynamic-module=../nginx-otel-${NGINX_OTEL_VERSION} \
+    --with-openssl=../openssl-${OPENSSL_VERSION} \
+    --with-pcre \
+    --with-pcre-jit \
+    --with-threads \
+    --with-zlib=../zlib-${ZLIB_VERSION} \
+    --without-http_fastcgi_module \
+    --without-http_scgi_module \
+    --without-http_uwsgi_module && \
+    make -j1 && \
+    make -j1 install && \
+    mkdir -p lib modules && \
+    cp $(ldd -v nginx | awk '{print $NF}' | sed 's/:$//; /^(\|^info/d; /^$\|^\./d' | sort -u | xargs) lib/ && \
+    cp objs/ngx_otel_module.so modules/ && \
+    tar cfvz ../nginx.tgz nginx nginx.conf logs lib modules && \
+    ./nginx -V && ls -l ./nginx
+
+#  --prefix=nginx-static \
+#  --with-cc-opt="-static -static-libgcc" \
+#  --with-ld-opt="-static" --with-cpu-opt=generic --with-pcre \
+#  --with-select_module --with-poll_module \
+#  --with-http_ssl_module --with-http_realip_module \
+#  --with-http_addition_module --with-http_sub_module \
+#  --with-http_gunzip_module \
+#  --with-http_gzip_static_module --with-http_auth_request_module \
+#  --with-http_random_index_module --with-http_secure_link_module \
+#  --with-http_degradation_module --with-http_stub_status_module \
+#  --with-openssl=../openssl-${OPENSSL_VERSION} && \
+# with -j > 1 nginx's tries to link openssl before it gets built
+
+RUN ldd /tmp/nginx/nginx || true
+
+FROM debian:stable-slim
+COPY --from=0 /tmp/nginx.tgz /
+RUN mkdir -p /tmp/ngx && cd /tmp/ngx && tar xvf /nginx.tgz 
+
+FROM debian:stable-slim
+ENV LD_LIBRARY_PATH=./lib
+COPY --from=1 /tmp/ngx /nginx
+#COPY --from=0 /tmp/nginx/nginx /tmp/nginx/nginx.conf /tmp/nginx/logs/ /tmp/nginx/lib/ /tmp/nginx/modules/ /nginx/
+WORKDIR /nginx
